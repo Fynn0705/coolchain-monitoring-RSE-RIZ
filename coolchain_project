@@ -1,0 +1,164 @@
+import os
+import sys
+import pyodbc
+from collections import namedtuple
+from typing import List, Tuple
+from datetime import timedelta
+
+# ------------------------------------------------
+# SQL-Verbindung: nur v_coolchain_crypt
+# ------------------------------------------------
+def fetch_events(transportid: str):
+    server = 'sc-db-server.database.windows.net'
+    database = 'supplychain'
+    username = 'rse'
+    password = 'Pa$$w0rd'
+
+    conn_str = (
+        f'DRIVER={{ODBC Driver 18 for SQL Server}};'
+        f'SERVER={server};'
+        f'DATABASE={database};'
+        f'UID={username};'
+        f'PWD={password};'
+        f'Encrypt=no;'
+    )
+
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+
+    # Nur die 3 Spalten verwenden, die wir brauchen
+    query = """
+    SELECT transportID, direction, datetime
+    FROM dbo.v_coolchain_crypt
+    WHERE transportID = ?
+    ORDER BY datetime
+    """
+    cursor.execute(query, (transportid,))
+
+    Event = namedtuple("Event", ["transportid", "direction", "datetime"])
+    events = [Event(*row) for row in cursor.fetchall()]
+
+    cursor.close()
+    conn.close()
+    return events
+
+# ------------------------------------------------
+# Prüf-Funktion 1: Konsistenz
+# ------------------------------------------------
+def check_consistency(events) -> Tuple[bool, List[str]]:
+    messages = []
+    ok = True
+
+    for i in range(1, len(events)):
+        prev = events[i - 1]
+        curr = events[i]
+
+        if curr.datetime < prev.datetime:
+            ok = False
+            messages.append(f"Zeitliche Unstimmigkeit: {curr.datetime} liegt vor {prev.datetime}")
+
+        if prev.direction == curr.direction:
+            ok = False
+            messages.append(f"Doppeltes {curr.direction}-Event hintereinander ({curr.datetime})")
+
+    if ok:
+        messages.append("Konsistenzprüfung erfolgreich")
+    return ok, messages
+
+# ------------------------------------------------
+# Prüf-Funktion 2: Übergabelücken
+# ------------------------------------------------
+def check_hand_over_gaps(events) -> Tuple[bool, List[str]]:
+    messages = []
+    ok = True
+    limit = timedelta(minutes=10)
+
+    for i in range(1, len(events)):
+        prev = events[i - 1]
+        curr = events[i]
+
+        if prev.direction == "out" and curr.direction == "in":
+            diff = curr.datetime - prev.datetime
+            if diff > limit:
+                ok = False
+                messages.append(
+                    f"Übergabe > 10 min: {diff} zwischen {prev.datetime} und {curr.datetime}"
+                )
+
+    if ok:
+        messages.append("Alle Übergaben im Limit")
+    return ok, messages
+
+# ------------------------------------------------
+# Prüf-Funktion 3: Transportdauer
+# ------------------------------------------------
+def check_total_duration(events) -> Tuple[bool, List[str]]:
+    messages = []
+    limit = timedelta(hours=48)
+
+    if not events:
+        return False, ["Keine Events vorhanden"]
+
+    start = events[0].datetime
+    end = events[-1].datetime
+    duration = end - start
+
+    if events[-1].direction == "in":
+        messages.append(
+            f"Transport nicht abgeschlossen (letztes Event 'in'). "
+            f"Bisherige Dauer: {duration} (kein Fehler)."
+        )
+        return True, messages
+
+    if duration > limit:
+        return False, [f"Transportdauer > 48h: {duration}"]
+
+    return True, [f"Transportdauer ok: {duration}"]
+
+# ------------------------------------------------
+# Hauptauswertung
+# ------------------------------------------------
+def evaluate_transport(transportid: str) -> Tuple[bool, List[str]]:
+    events = fetch_events(transportid)
+    messages: List[str] = []
+
+    if not events:
+        return False, ["Es gibt gar keinen Eintrag (keine Events gefunden)."]
+
+    c_ok, c_msgs = check_consistency(events)
+    g_ok, g_msgs = check_hand_over_gaps(events)
+    d_ok, d_msgs = check_total_duration(events)
+
+    ok = c_ok and g_ok and d_ok
+    messages.extend(c_msgs + g_msgs + d_msgs)
+
+    return ok, messages
+
+# ------------------------------------------------
+# Main
+# ------------------------------------------------
+def main():
+    ids = sys.argv[1:] or [
+        "72359278599178561029675",
+        "15668407856331648336231",
+        "73491878556297128760578",
+        "99346757838434834886542",
+        "46204863139457546291334",
+    ]
+
+    if not ids:
+        print("Bitte Transport-IDs als Argumente übergeben oder in main() eintragen.")
+        sys.exit(0)
+
+    print(f"Prüfe {len(ids)} Transport(e)\n")
+
+    for tid in ids:
+        ok, msgs = evaluate_transport(tid)
+        status = "KORREKT" if ok else "FEHLER"
+        print(f"Transport-ID {tid}: {status}")
+        for m in msgs:
+            print(f" - {m}")
+        print()
+
+if __name__ == "__main__":
+    main()
